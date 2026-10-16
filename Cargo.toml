@@ -13,6 +13,7 @@ bytes = "1.7"
 crc32c = "0.6"
 crossbeam-channel = "0.5"
 crossbeam-skiplist = "0.1"
+libc = "0.2"
 parking_lot = "0.12"
 smallvec = { version = "1.13", features = ["union"] }
 thiserror = "2.0"
@@ -27,7 +28,7 @@ tempfile = "3.12"
 tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
 
 [workspace]
-members = ["."]
+members = [".", "bench"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

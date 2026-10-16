@@ -15,7 +15,7 @@ pub mod builder;
 pub mod reader;
 
 pub use builder::TableBuilder;
-pub use reader::{Lookup, ReadMode, Table, TableIter};
+pub use reader::{Lookup, ReadMode, Table, TableCtx, TableIter};
 
 pub const FOOTER_LEN: usize = 40;
 pub const MAGIC: u64 = 0x5275_7374_4c6f_6731; // "RustLog1"

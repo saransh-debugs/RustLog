@@ -36,7 +36,7 @@ use crate::key::{self, ValueKind, MAX_SEQ};
 use crate::manifest::{self, ManifestWriter, VersionEdit};
 use crate::memtable::MemTable;
 use crate::options::{Options, WriteOptions};
-use crate::sstable::{Lookup, ReadMode, Table};
+use crate::sstable::{Lookup, ReadMode, Table, TableCtx};
 use crate::stats::{self, Stats, StatsSnapshot};
 use crate::version::{FileMeta, Version};
 use crate::wal::{self, WalWriter};
@@ -86,7 +86,7 @@ pub(crate) struct Inner {
     pub stall_cv: Condvar,
     pub flush_tx: crossbeam_channel::Sender<()>,
     pub compact_tx: crossbeam_channel::Sender<()>,
-    pub deleter_tx: crossbeam_channel::Sender<PathBuf>,
+    pub table_ctx: TableCtx,
     /// Bumped after every flush / compaction round, so async callers can
     /// wait for background progress without polling.
     pub bg_progress: watch::Sender<u64>,
@@ -133,14 +133,7 @@ impl Inner {
     }
 
     pub fn open_table(&self, meta: FileMeta) -> Result<Arc<Table>> {
-        let path = io::sst_path(&self.dir, meta.number);
-        Ok(Arc::new(Table::open(
-            path,
-            meta,
-            Arc::clone(&self.cache),
-            Arc::clone(&self.stats),
-            Some(self.deleter_tx.clone()),
-        )?))
+        Ok(Arc::new(Table::open(io::sst_path(&self.dir, meta.number), meta, &self.table_ctx)?))
     }
 
     /// Replaces `state` with `f(current)`. The only way state changes.
@@ -492,6 +485,13 @@ fn open_blocking(dir: PathBuf, opts: Options) -> Result<Db> {
     let (deleter_tx, deleter_rx) = crossbeam_channel::unbounded::<PathBuf>();
     let (flush_tx, flush_rx) = crossbeam_channel::bounded::<()>(1);
     let (compact_tx, compact_rx) = crossbeam_channel::bounded::<()>(1);
+    let table_ctx = TableCtx {
+        cache: Arc::clone(&cache),
+        stats: Arc::clone(&stats),
+        deleter: Some(deleter_tx.clone()),
+        bypass_os_cache: opts.bypass_os_cache,
+        simulated_read_latency: opts.simulated_read_latency,
+    };
 
     // Highest file number in use, so new files never collide with orphans.
     let max_existing = existing
@@ -508,13 +508,7 @@ fn open_blocking(dir: PathBuf, opts: Options) -> Result<Db> {
     let mut version = Version::new(opts.num_levels);
     for (lvl, files) in recovered.levels.iter().enumerate() {
         for meta in files.values() {
-            let t = Table::open(
-                io::sst_path(&dir, meta.number),
-                meta.clone(),
-                Arc::clone(&cache),
-                Arc::clone(&stats),
-                Some(deleter_tx.clone()),
-            )?;
+            let t = Table::open(io::sst_path(&dir, meta.number), meta.clone(), &table_ctx)?;
             version.levels[lvl].push(Arc::new(t));
         }
     }
@@ -556,13 +550,7 @@ fn open_blocking(dir: PathBuf, opts: Options) -> Result<Db> {
     if !replay_mem.is_empty() {
         let number = next_file.fetch_add(1, Ordering::SeqCst);
         let meta = flush::write_memtable(&dir, &opts, number, &replay_mem)?;
-        let t = Table::open(
-            io::sst_path(&dir, number),
-            meta.clone(),
-            Arc::clone(&cache),
-            Arc::clone(&stats),
-            Some(deleter_tx.clone()),
-        )?;
+        let t = Table::open(io::sst_path(&dir, number), meta, &table_ctx)?;
         version.levels[0].push(Arc::new(t));
         version = version.sorted();
         io::sync_dir(&dir)?;
@@ -621,7 +609,7 @@ fn open_blocking(dir: PathBuf, opts: Options) -> Result<Db> {
         stall_cv: Condvar::new(),
         flush_tx,
         compact_tx,
-        deleter_tx,
+        table_ctx,
         bg_progress,
         cache,
         stats,

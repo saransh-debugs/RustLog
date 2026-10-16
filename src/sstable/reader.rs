@@ -53,24 +53,44 @@ pub struct Table {
     path: PathBuf,
     index: Block,
     filter: BloomFilter,
-    cache: Arc<BlockCache>,
-    stats: Arc<Stats>,
+    ctx: TableCtx,
     /// Set once a compaction has replaced this table in the MANIFEST.
     obsolete: AtomicBool,
+}
+
+/// What every open table shares with the engine.
+#[derive(Debug, Clone)]
+pub struct TableCtx {
+    pub cache: Arc<BlockCache>,
+    pub stats: Arc<Stats>,
     /// Where to send our path for deletion when the last reader lets go.
-    deleter: Option<crossbeam_channel::Sender<PathBuf>>,
+    pub deleter: Option<crossbeam_channel::Sender<PathBuf>>,
+    /// BENCHMARK ONLY: make every block read go to the device.
+    pub bypass_os_cache: bool,
+    /// BENCHMARK ONLY: extra sleep per block read, to model a slower device.
+    pub simulated_read_latency: std::time::Duration,
+}
+
+impl TableCtx {
+    #[cfg(test)]
+    pub fn for_test(cache_bytes: usize) -> Self {
+        TableCtx {
+            cache: Arc::new(BlockCache::new(cache_bytes)),
+            stats: Arc::new(Stats::default()),
+            deleter: None,
+            bypass_os_cache: false,
+            simulated_read_latency: std::time::Duration::ZERO,
+        }
+    }
 }
 
 impl Table {
     /// Opens and validates a table. Blocking.
-    pub fn open(
-        path: PathBuf,
-        meta: FileMeta,
-        cache: Arc<BlockCache>,
-        stats: Arc<Stats>,
-        deleter: Option<crossbeam_channel::Sender<PathBuf>>,
-    ) -> Result<Table> {
+    pub fn open(path: PathBuf, meta: FileMeta, ctx: &TableCtx) -> Result<Table> {
         let file = File::open(&path)?;
+        if ctx.bypass_os_cache {
+            os_cache::disable(&file)?;
+        }
         let size = file.metadata()?.len();
         if size != meta.size {
             return Err(Error::corruption(format!(
@@ -91,18 +111,16 @@ impl Table {
         }
         let fh = BlockHandle::decode(&footer[0..16]).ok_or_else(bad)?;
         let ih = BlockHandle::decode(&footer[16..32]).ok_or_else(bad)?;
-        let filter_bytes = read_checked(&file, fh, size)?;
-        let index = Block::new(read_checked(&file, ih, size)?)?;
+        let filter_bytes = read_checked(&file, fh, size, false)?;
+        let index = Block::new(read_checked(&file, ih, size, false)?)?;
         Ok(Table {
             meta,
             file,
             path,
             index,
             filter: BloomFilter::new(filter_bytes),
-            cache,
-            stats,
+            ctx: ctx.clone(),
             obsolete: AtomicBool::new(false),
-            deleter,
         })
     }
 
@@ -117,16 +135,20 @@ impl Table {
 
     fn read_block(&self, h: BlockHandle, mode: ReadMode) -> Result<Option<Block>> {
         let ck = (self.meta.number, h.offset);
-        if let Some(b) = self.cache.get(ck) {
+        if let Some(b) = self.ctx.cache.get(ck) {
             return Ok(Some(b));
         }
         let ReadMode::Io { fill_cache } = mode else {
             return Ok(None);
         };
-        stats::add(&self.stats.disk_block_reads, 1);
-        let block = Block::new(read_checked(&self.file, h, self.meta.size)?)?;
+        stats::add(&self.ctx.stats.disk_block_reads, 1);
+        let block = Block::new(read_checked(&self.file, h, self.meta.size, self.ctx.bypass_os_cache)?)?;
+        if !self.ctx.simulated_read_latency.is_zero() {
+            // Same effect on the calling thread as a slow `pread`: it sleeps.
+            std::thread::sleep(self.ctx.simulated_read_latency);
+        }
         if fill_cache {
-            self.cache.insert(ck, block.clone());
+            self.ctx.cache.insert(ck, block.clone());
         }
         Ok(Some(block))
     }
@@ -134,9 +156,9 @@ impl Table {
     /// Finds the newest version of `user_key` with seq <= the seq inside
     /// `seek_key` (see `key::seek_key`).
     pub fn get(&self, user_key: &[u8], seek_key: &[u8], mode: ReadMode) -> Result<Lookup> {
-        stats::add(&self.stats.bloom_checks, 1);
+        stats::add(&self.ctx.stats.bloom_checks, 1);
         if !self.filter.may_contain(user_key) {
-            stats::add(&self.stats.bloom_negatives, 1);
+            stats::add(&self.ctx.stats.bloom_negatives, 1);
             return Ok(Lookup::NotFound);
         }
         let mut idx = self.index.iter();
@@ -174,14 +196,14 @@ impl Drop for Table {
         // dropped on a Tokio worker, and `unlink` is a blocking syscall.
         // If the channel is gone (shutdown), the next `open` cleans up
         // orphans, so ignoring the error loses nothing.
-        if let Some(d) = &self.deleter {
+        if let Some(d) = &self.ctx.deleter {
             let _ = d.send(self.path.clone());
         }
     }
 }
 
 /// Reads a block plus its CRC trailer and checks it. Blocking.
-fn read_checked(file: &File, h: BlockHandle, file_size: u64) -> Result<Bytes> {
+fn read_checked(file: &File, h: BlockHandle, file_size: u64, drop_from_os_cache: bool) -> Result<Bytes> {
     let total = h
         .len
         .checked_add(BLOCK_TRAILER_LEN as u64)
@@ -191,6 +213,9 @@ fn read_checked(file: &File, h: BlockHandle, file_size: u64) -> Result<Bytes> {
     // block can be shared (cache + iterators) without copying.
     let mut buf = BytesMut::zeroed(total as usize);
     file.read_exact_at(&mut buf, h.offset)?;
+    if drop_from_os_cache {
+        os_cache::evict(file, h.offset, total);
+    }
     let data_len = h.len as usize;
     let stored = get_u32(&buf, data_len).ok_or_else(|| Error::corruption("missing block crc"))?;
     if masked_crc(&buf[..data_len]) != stored {
@@ -198,6 +223,43 @@ fn read_checked(file: &File, h: BlockHandle, file_size: u64) -> Result<Bytes> {
     }
     buf.truncate(data_len);
     Ok(buf.freeze())
+}
+
+/// Benchmark-only helpers to take the OS page cache out of the picture, so a
+/// "disk read" in a benchmark really waits on the device.
+mod os_cache {
+    use std::fs::File;
+
+    /// macOS: `F_NOCACHE` makes reads on this fd skip the unified buffer cache.
+    #[cfg(target_os = "macos")]
+    pub fn disable(f: &File) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain fcntl on an fd we own; no pointers involved.
+        let r = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn disable(_f: &File) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Linux: O_DIRECT needs aligned buffers and offsets, which our block
+    /// layout doesn't have. Instead, evict the range right after reading it.
+    #[cfg(target_os = "linux")]
+    pub fn evict(f: &File, off: u64, len: u64) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: advisory call on an fd we own; failure is harmless.
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn evict(_f: &File, _off: u64, _len: u64) {}
 }
 
 /// Two-level iterator: walk the index, load each data block, walk it.
@@ -297,7 +359,7 @@ mod tests {
         }
         let built = b.finish().unwrap();
         let meta = FileMeta { number: 1, size: built.size, smallest: built.smallest, largest: built.largest };
-        Arc::new(Table::open(path, meta, Arc::new(BlockCache::new(8 << 20)), Arc::new(Stats::default()), None).unwrap())
+        Arc::new(Table::open(path, meta, &TableCtx::for_test(8 << 20)).unwrap())
     }
 
     #[test]
@@ -312,13 +374,13 @@ mod tests {
             assert_eq!(got, Lookup::Value(Bytes::from(format!("value{i}"))));
         }
         // Missing keys: mostly skipped by the bloom filter.
-        let before = t.stats.bloom_negatives.load(Ordering::Relaxed);
+        let before = t.ctx.stats.bloom_negatives.load(Ordering::Relaxed);
         for i in 0..10_000 {
             let uk = format!("nope{i:08}");
             let got = t.get(uk.as_bytes(), &key::seek_key(uk.as_bytes(), 1 << 40), mode).unwrap();
             assert_eq!(got, Lookup::NotFound);
         }
-        let skipped = t.stats.bloom_negatives.load(Ordering::Relaxed) - before;
+        let skipped = t.ctx.stats.bloom_negatives.load(Ordering::Relaxed) - before;
         assert!(skipped > 9_800, "bloom skipped only {skipped}/10000");
 
         let mut it = t.iter(false);
@@ -373,7 +435,7 @@ mod tests {
                 smallest: built.smallest.clone(),
                 largest: built.largest.clone(),
             };
-            let res = Table::open(path.clone(), meta, Arc::new(BlockCache::new(0)), Arc::new(Stats::default()), None);
+            let res = Table::open(path.clone(), meta, &TableCtx::for_test(0));
             let Ok(t) = res else { continue };
             let t = Arc::new(t);
             // Every key must be either correct or an error. Never a wrong value.

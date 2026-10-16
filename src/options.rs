@@ -45,6 +45,15 @@ pub struct Options {
     /// of `spawn_blocking`. Exists so the benchmark can show the damage.
     #[doc(hidden)]
     pub inline_disk_reads: bool,
+    /// BENCHMARK ONLY: make SSTable block reads skip the OS page cache
+    /// (`F_NOCACHE` on macOS, evict-after-read on Linux), so a cache miss
+    /// really waits on the device.
+    #[doc(hidden)]
+    pub bypass_os_cache: bool,
+    /// BENCHMARK ONLY: sleep this long per SSTable block read, to model a
+    /// slow device (e.g. ~1 ms for a cloud network disk).
+    #[doc(hidden)]
+    pub simulated_read_latency: std::time::Duration,
     /// TEST ONLY: make chosen I/O calls fail.
     #[doc(hidden)]
     pub fail_points: Option<Arc<FailPoints>>,
@@ -71,6 +80,8 @@ impl Default for Options {
             max_key_size: 64 << 10,
             max_value_size: 16 << 20,
             inline_disk_reads: false,
+            bypass_os_cache: false,
+            simulated_read_latency: std::time::Duration::ZERO,
             fail_points: None,
         }
     }

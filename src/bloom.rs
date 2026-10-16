@@ -115,6 +115,7 @@ mod tests {
         let probes = 100_000;
         let fp = (0..probes).filter(|i| f.may_contain(format!("missing{i}").as_bytes())).count();
         let rate = fp as f64 / probes as f64;
+        eprintln!("bloom false positive rate at 10 bits/key: {:.3}%", rate * 100.0);
         // Theory for k=7, 10 bits/key: ~0.82%.
         assert!(rate < 0.015, "false positive rate too high: {rate}");
     }
