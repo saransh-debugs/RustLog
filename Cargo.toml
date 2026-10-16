@@ -1,0 +1,48 @@
+[package]
+name = "rustlog"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "A disk-backed LSM-tree storage engine with a WAL, leveled compaction and Bloom filters, built on Tokio."
+license = "MIT"
+publish = false
+
+[dependencies]
+arc-swap = "1.7"
+bytes = "1.7"
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+crossbeam-skiplist = "0.1"
+parking_lot = "0.12"
+smallvec = { version = "1.13", features = ["union"] }
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+proptest = "1.5"
+rand = "0.9"
+tempfile = "3.12"
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "allow"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+opt-level = 1

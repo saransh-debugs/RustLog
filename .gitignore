@@ -25,3 +25,5 @@ target/
 .DS_Store
 .vscode/
 .idea/
+Cargo.lock.bak
+/bench/results/*.tmp
