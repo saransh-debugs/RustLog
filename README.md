@@ -37,7 +37,7 @@ In-memory key-value stores are easy. Real databases are bound by the disk, and t
 
 ### Why not mmap?
 
-The project spec said to read SSTables with mmap and push page faults onto `spawn_blocking`. I didn't use mmap at all:
+The obvious design is to mmap the SSTables and push page faults onto `spawn_blocking`. I didn't use mmap at all:
 
 - A disk error inside mmap is a **SIGBUS**. The process dies; there's no error to handle.
 - You **can't cap** how much memory it uses.
@@ -220,3 +220,7 @@ src/
 tests/            integration, model, crash, fault tests
 bench/            db_bench-style benchmark, RocksDB baseline
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
